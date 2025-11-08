@@ -1,6 +1,7 @@
 import logging
 from abc import ABC, abstractmethod
-from typing import Dict, List
+from typing import Any, Dict, List, Optional
+from urllib.parse import urlencode
 
 import httpx
 
@@ -33,25 +34,22 @@ class SiliconModelProvider(AbstractModelProvider):
 
             headers = {"Authorization": f"Bearer {model_api_key}"}
 
-            # Choose endpoint by model type
-            if model_type in ("llm", "vlm"):
-                silicon_url = f"{SILICON_GET_URL}?sub_type=chat"
-            elif model_type in ("embedding", "multi_embedding"):
-                silicon_url = f"{SILICON_GET_URL}?sub_type=embedding"
-            else:
-                silicon_url = SILICON_GET_URL
-
             async with httpx.AsyncClient(verify=False) as client:
-                response = await client.get(silicon_url, headers=headers)
-                response.raise_for_status()
-                model_list: List[Dict] = response.json()["data"]
+                model_list = await self._fetch_models_with_fallback(
+                    client, headers, model_type
+                )
+
+            if not model_list:
+                return []
+
+            model_list = self._filter_models_by_type(model_list, model_type)
 
             # Annotate models with canonical fields expected downstream
             if model_type in ("llm", "vlm"):
                 for item in model_list:
                     item["model_tag"] = "chat"
                     item["model_type"] = model_type
-                    item["max_tokens"] = DEFAULT_LLM_MAX_TOKENS
+                    item.setdefault("max_tokens", DEFAULT_LLM_MAX_TOKENS)
             elif model_type in ("embedding", "multi_embedding"):
                 for item in model_list:
                     item["model_tag"] = "embedding"
@@ -61,6 +59,148 @@ class SiliconModelProvider(AbstractModelProvider):
         except Exception as e:
             logger.error(f"Error getting models from silicon: {e}")
             return []
+
+    async def _fetch_models_with_fallback(
+        self,
+        client: httpx.AsyncClient,
+        headers: Dict[str, str],
+        model_type: str,
+    ) -> List[Dict]:
+        """Fetch SiliconFlow models trying multiple parameter variants."""
+
+        for params in self._candidate_query_params(model_type):
+            silicon_url = self._build_url(params)
+            try:
+                response = await client.get(silicon_url, headers=headers)
+                response.raise_for_status()
+                payload = response.json()
+                model_list = self._extract_model_list(payload)
+                if model_list:
+                    return model_list
+            except Exception as exc:  # Broad except to log and continue fallback
+                logger.warning(
+                    "Failed to fetch SiliconFlow models from %s: %s",
+                    silicon_url,
+                    exc,
+                )
+                continue
+
+        return []
+
+    def _candidate_query_params(self, model_type: str) -> List[Optional[Dict[str, str]]]:
+        """Return ordered query parameter permutations for SiliconFlow."""
+
+        if model_type in ("llm", "vlm"):
+            return [
+                {"task": "chat-completion"},
+                {"type": "chat"},
+                {"sub_type": "chat"},
+                None,
+            ]
+        if model_type in ("embedding", "multi_embedding"):
+            return [
+                {"task": "text-embedding"},
+                {"type": "embedding"},
+                {"sub_type": "embedding"},
+                None,
+            ]
+        return [None]
+
+    @staticmethod
+    def _build_url(params: Optional[Dict[str, str]]) -> str:
+        if not params:
+            return SILICON_GET_URL
+        return f"{SILICON_GET_URL}?{urlencode(params)}"
+
+    @staticmethod
+    def _extract_model_list(payload: Dict[str, Any]) -> List[Dict]:
+        """Best-effort extraction of model entries from SiliconFlow payloads.
+
+        SiliconFlow responses have changed shape multiple times. Earlier
+        versions returned a simple ``{"data": [..models..]}`` payload, while
+        more recent deployments wrap the list under nested ``data`` / ``list``
+        / ``items`` keys. Some installations also expose the models under a top
+        level ``models`` key. To keep backward compatibility we perform a
+        depth-first search that stops at the first list encountered.
+        """
+
+        preferred_keys = ("data", "list", "models", "items", "records", "result", "results")
+
+        def _search(node: Any) -> Optional[List[Dict[str, Any]]]:
+            if isinstance(node, list):
+                # Filter out non-dict entries to avoid iterating over primitive
+                # values in subsequent processing steps.
+                return [item for item in node if isinstance(item, dict)]
+
+            if isinstance(node, dict):
+                # First try well-known keys to keep the behaviour deterministic
+                # when multiple lists exist at different nesting levels.
+                for key in preferred_keys:
+                    if key in node:
+                        found = _search(node[key])
+                        if found:
+                            return found
+
+                # Fall back to exploring every value. This guards against
+                # undocumented schema changes where the list is stored under a
+                # previously unseen key.
+                for value in node.values():
+                    found = _search(value)
+                    if found:
+                        return found
+
+            return None
+
+        models = _search(payload)
+        return models or []
+
+    def _filter_models_by_type(
+        self, model_list: List[Dict], model_type: str
+    ) -> List[Dict]:
+        if not model_list:
+            return model_list
+
+        filtered = [
+            model
+            for model in model_list
+            if self._matches_model_type(model, model_type)
+        ]
+
+        # If filtering removed everything, fall back to the original list to avoid regressions.
+        return filtered or model_list
+
+    @staticmethod
+    def _matches_model_type(model: Dict[str, Any], model_type: str) -> bool:
+        if model_type not in ("llm", "vlm", "embedding", "multi_embedding"):
+            return True
+
+        task = str(model.get("task", "")).lower()
+        model_type_field = str(model.get("type", "")).lower()
+        tags = {
+            str(tag).lower()
+            for tag in model.get("tags", [])
+            if isinstance(tag, str)
+        }
+
+        if model_type in ("llm", "vlm"):
+            llm_markers = {"chat", "chat-completion", "chat_completion", "text-generation", "vlm"}
+            return bool(
+                (task and any(marker in task for marker in llm_markers))
+                or (model_type_field and any(marker in model_type_field for marker in llm_markers))
+                or tags.intersection(llm_markers | {"llm"})
+            )
+
+        embedding_markers = {
+            "embedding",
+            "text-embedding",
+            "text_embedding",
+            "multi_embedding",
+        }
+        return bool(
+            (task and any(marker in task for marker in embedding_markers))
+            or (model_type_field and any(marker in model_type_field for marker in embedding_markers))
+            or tags.intersection(embedding_markers)
+        )
 
 
 async def prepare_model_dict(provider: str, model: dict, model_url: str, model_api_key: str) -> dict:
