@@ -83,9 +83,51 @@ async def test_get_models_llm_success():
         # Assert returned value & correct HTTP call
         assert result == [{"id": "gpt-4", "model_tag": "chat", "model_type": "llm", "max_tokens": sys.modules["consts.const"].DEFAULT_LLM_MAX_TOKENS}]
         mock_client_instance.get.assert_called_once_with(
-            "https://silicon.com?sub_type=chat",
+            "https://silicon.com?task=chat-completion",
             headers={"Authorization": "Bearer test-key"},
         )
+
+
+@pytest.mark.asyncio
+async def test_get_models_llm_nested_payload():
+    """Provider should handle deeply nested SiliconFlow payloads."""
+    provider_config = {"model_type": "llm", "api_key": "test-key"}
+
+    with mock.patch("backend.services.model_provider_service.httpx.AsyncClient") as mock_client, \
+         mock.patch("backend.services.model_provider_service.SILICON_GET_URL", "https://silicon.com"):
+
+        mock_client_instance = mock.AsyncMock()
+        mock_client.return_value.__aenter__.return_value = mock_client_instance
+
+        mock_response = mock.Mock()
+        mock_response.status_code = 200
+        mock_response.raise_for_status = mock.Mock()
+        mock_response.json.return_value = {
+            "code": 0,
+            "message": "success",
+            "data": {
+                "pagination": {"page": 1, "page_size": 20},
+                "list": {
+                    "items": [
+                        {
+                            "id": "Qwen/Qwen2.5-7B-Instruct",
+                            "task": "text-generation",
+                        }
+                    ]
+                },
+            },
+        }
+        mock_client_instance.get.return_value = mock_response
+
+        result = await SiliconModelProvider().get_models(provider_config)
+
+        assert result == [{
+            "id": "Qwen/Qwen2.5-7B-Instruct",
+            "task": "text-generation",
+            "model_tag": "chat",
+            "model_type": "llm",
+            "max_tokens": sys.modules["consts.const"].DEFAULT_LLM_MAX_TOKENS,
+        }]
 
 
 @pytest.mark.asyncio
@@ -113,7 +155,7 @@ async def test_get_models_embedding_success():
             "model_type": "embedding",
         }]
         mock_client_instance.get.assert_called_once_with(
-            "https://silicon.com?sub_type=embedding",
+            "https://silicon.com?task=text-embedding",
             headers={"Authorization": "Bearer test-key"},
         )
 
